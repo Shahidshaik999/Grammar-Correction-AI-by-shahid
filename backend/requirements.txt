@@ -5,3 +5,11 @@ torch
 transformers
 pydantic
 python-multipart
+fastapi.middleware.cors
+aiofiles
+httpx
+pytest
+pytest-asyncio
+black
+isort
+mypy

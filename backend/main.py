@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from typing import Optional, Literal
 
 import language_tool_python
+from language_tool_python.exceptions import RateLimitError
 
 import torch
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
@@ -14,9 +15,6 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
 app = FastAPI()
 
-# NOTE:
-#  - Don't put trailing "/" in origins
-#  - Add your Vercel frontend here
 origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
@@ -25,18 +23,41 @@ origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,      # for quick testing you can use ["*"]
+    allow_origins=origins,   # for quick testing you COULD use ["*"]
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # -------------------------------------------------
-# LanguageTool (grammar) - using PUBLIC API
+# LanguageTool (grammar) – SAFE lazy init
 # -------------------------------------------------
 
-# This version does NOT require Java. It calls LanguageTool's public HTTP API.
-tool = language_tool_python.LanguageToolPublicAPI("en-US")
+_lt_tool = None  # cached instance
+
+
+def get_language_tool():
+    """
+    Lazily create the LanguageToolPublicAPI client.
+
+    If rate-limited or any error occurs, return None so that
+    the rest of the backend still works and deployment doesn't crash.
+    """
+    global _lt_tool
+    if _lt_tool is not None:
+        return _lt_tool
+
+    try:
+        _lt_tool = language_tool_python.LanguageToolPublicAPI("en-US")
+        return _lt_tool
+    except RateLimitError:
+        # Free API rate limit hit; skip grammar server but keep app running
+        _lt_tool = None
+        return None
+    except Exception:
+        # Any other error: don't break the whole app
+        _lt_tool = None
+        return None
 
 
 class TextRequest(BaseModel):
@@ -49,14 +70,19 @@ def simple_correct(text: str, mode: str = "grammar"):
     if not updated:
         return "", "No text provided."
 
-    # 1) Grammar + spelling via LanguageTool
-    try:
-        matches = tool.check(updated)
-        updated = language_tool_python.utils.correct(updated, matches)
-        lt_used = True
-    except Exception:
-        # If LanguageTool public API fails, don't crash the whole backend
-        lt_used = False
+    lt_used = False
+    tool = get_language_tool()
+
+    # 1) Grammar + spelling via LanguageTool if available
+    if tool is not None:
+        try:
+            matches = tool.check(updated)
+            updated = language_tool_python.utils.correct(updated, matches)
+            lt_used = True
+        except RateLimitError:
+            lt_used = False
+        except Exception:
+            lt_used = False
 
     # 2) Capitalize first letter
     updated = updated.strip()
@@ -87,7 +113,7 @@ def simple_correct(text: str, mode: str = "grammar"):
     else:
         summary = (
             f"Basic cleanup applied with {mode} style. "
-            "LanguageToolPublicAPI was not available at the moment."
+            "LanguageToolPublicAPI was not available (rate limit or network error)."
         )
 
     return updated, summary
@@ -115,13 +141,11 @@ def correct_text(body: TextRequest):
 
 
 # -------------------------------------------------
-# Smart Rewrite v3 – offline T5 paraphraser
+# Smart Rewrite v3 – T5 paraphraser
 # -------------------------------------------------
 
-# NOTE:
-# flan-t5-large is heavy and may crash on small Render instances.
-# You can try flan-t5-base which uses less memory.
-PARA_MODEL_NAME = "google/flan-t5-base"  # change back to flan-t5-large if your instance can handle it
+# flan-t5-large is very heavy; flan-t5-base is safer on small instances
+PARA_MODEL_NAME = "google/flan-t5-base"
 
 para_tokenizer = AutoTokenizer.from_pretrained(PARA_MODEL_NAME)
 para_model = AutoModelForSeq2SeqLM.from_pretrained(PARA_MODEL_NAME)
@@ -173,7 +197,7 @@ def cleanup_generated(text: str) -> str:
 
 @app.post("/polish-ai")
 def polish_ai(body: AIRewriteRequest):
-    # Step 1: basic grammar fix
+    # Step 1: basic grammar fix (best-effort)
     base_corrected, _ = simple_correct(body.text, "grammar")
 
     # Step 2: build prompt
@@ -204,7 +228,6 @@ def polish_ai(body: AIRewriteRequest):
         f"'{body.tone}' tone and '{body.style}' writing style."
     )
 
-    # frontend expects correctedText
     return {
         "correctedText": polished_text,
         "changesSummary": summary,
