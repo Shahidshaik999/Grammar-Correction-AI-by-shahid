@@ -1,11 +1,7 @@
 fastapi
-
-uvicorn
-
+uvicorn[standard]
 language_tool_python
-
 torch
-
 transformers
-
 pydantic
+python-multipart
