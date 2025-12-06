@@ -16,16 +16,10 @@ export type StyleProfile =
   | "ielts"
   | "romantic";
 
-type PolishResponse = {
-  correctedText: string;
-  changesSummary: string;
-  appliedTone?: string;
-  appliedStyle?: string;
-};
-
-// Use env var in production, fall back to localhost in dev
-const BACKEND_BASE =
-  import.meta.env.VITE_API_URL || "http://localhost:8000";
+// 🔴 Use your deployed backend URL here
+const BACKEND_BASE = "https://grammar-correction-ai-by-shahid.onrender.com";
+// For local testing, you can temporarily change this back to:
+// const BACKEND_BASE = "http://localhost:8000";
 
 export async function polishText(text: string, mode: Mode = "grammar") {
   try {
@@ -40,8 +34,11 @@ export async function polishText(text: string, mode: Mode = "grammar") {
       return null;
     }
 
-    const data = (await res.json()) as PolishResponse;
-    return data;
+    const data = await res.json();
+    return data as {
+      correctedText: string;
+      changesSummary: string;
+    };
   } catch (err) {
     console.error("Fetch /correct error:", err);
     return null;
@@ -65,8 +62,11 @@ export async function polishWithAI(
       return null;
     }
 
-    const data = (await res.json()) as PolishResponse;
-    return data;
+    const data = await res.json();
+    return data as {
+      correctedText: string;
+      changesSummary: string;
+    };
   } catch (err) {
     console.error("Fetch /polish-ai error:", err);
     return null;
