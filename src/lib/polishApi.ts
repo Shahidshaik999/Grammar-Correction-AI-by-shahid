@@ -16,7 +16,16 @@ export type StyleProfile =
   | "ielts"
   | "romantic";
 
-const BACKEND_BASE = "http://localhost:8000";
+type PolishResponse = {
+  correctedText: string;
+  changesSummary: string;
+  appliedTone?: string;
+  appliedStyle?: string;
+};
+
+// Use env var in production, fall back to localhost in dev
+const BACKEND_BASE =
+  import.meta.env.VITE_API_URL || "http://localhost:8000";
 
 export async function polishText(text: string, mode: Mode = "grammar") {
   try {
@@ -31,11 +40,8 @@ export async function polishText(text: string, mode: Mode = "grammar") {
       return null;
     }
 
-    const data = await res.json();
-    return data as {
-      correctedText: string;
-      changesSummary: string;
-    };
+    const data = (await res.json()) as PolishResponse;
+    return data;
   } catch (err) {
     console.error("Fetch /correct error:", err);
     return null;
@@ -59,11 +65,8 @@ export async function polishWithAI(
       return null;
     }
 
-    const data = await res.json();
-    return data as {
-      correctedText: string;
-      changesSummary: string;
-    };
+    const data = (await res.json()) as PolishResponse;
+    return data;
   } catch (err) {
     console.error("Fetch /polish-ai error:", err);
     return null;
