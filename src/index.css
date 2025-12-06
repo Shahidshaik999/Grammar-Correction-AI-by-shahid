@@ -1,0 +1,127 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Dark Premium Theme - Always dark */
+    --background: 222 47% 8%;
+    --background-end: 222 35% 20%;
+    --foreground: 0 0% 100%;
+    
+    --card: 222 30% 12%;
+    --card-foreground: 0 0% 100%;
+    
+    --popover: 222 47% 10%;
+    --popover-foreground: 0 0% 100%;
+    
+    --primary: 227 100% 65%;
+    --primary-foreground: 0 0% 100%;
+    
+    --secondary: 222 25% 18%;
+    --secondary-foreground: 220 20% 75%;
+    
+    --muted: 222 25% 18%;
+    --muted-foreground: 220 20% 65%;
+    
+    --accent: 162 76% 55%;
+    --accent-foreground: 222 47% 8%;
+    
+    --success: 162 76% 55%;
+    --success-foreground: 222 47% 8%;
+    
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+    
+    --border: 222 25% 22%;
+    --input: 222 25% 16%;
+    --ring: 227 100% 65%;
+    
+    --radius: 0.75rem;
+    
+    /* Glass effect */
+    --glass-bg: rgba(255, 255, 255, 0.08);
+    --glass-border: rgba(255, 255, 255, 0.12);
+    
+    /* Sidebar (if needed) */
+    --sidebar-background: 222 47% 8%;
+    --sidebar-foreground: 0 0% 100%;
+    --sidebar-primary: 227 100% 65%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 222 25% 18%;
+    --sidebar-accent-foreground: 0 0% 100%;
+    --sidebar-border: 222 25% 22%;
+    --sidebar-ring: 227 100% 65%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: 'Inter', system-ui, sans-serif;
+  }
+}
+
+@layer components {
+  /* Premium Dark Gradient Background */
+  .gradient-bg {
+    background: linear-gradient(135deg, hsl(222, 47%, 8%) 0%, hsl(222, 35%, 20%) 100%);
+  }
+
+  /* Glass Card Effect */
+  .glass-card {
+    background: var(--glass-bg);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid var(--glass-border);
+  }
+
+  /* Solid Card */
+  .solid-card {
+    @apply bg-card border border-border;
+  }
+
+  /* Primary Button */
+  .btn-primary {
+    @apply bg-primary text-primary-foreground font-medium;
+    @apply hover:brightness-110 transition-all duration-200;
+  }
+
+  /* Editor Font */
+  .font-editor {
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  /* Soft shadow for cards */
+  .shadow-soft {
+    box-shadow: 0 4px 24px -4px rgba(0, 0, 0, 0.4), 0 2px 8px -2px rgba(0, 0, 0, 0.3);
+  }
+
+  /* Focus ring */
+  .focus-ring {
+    @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background;
+  }
+}
+
+@layer utilities {
+  /* Custom scrollbar */
+  .scrollbar-custom {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--border)) transparent;
+  }
+  .scrollbar-custom::-webkit-scrollbar {
+    width: 6px;
+  }
+  .scrollbar-custom::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .scrollbar-custom::-webkit-scrollbar-thumb {
+    background-color: hsl(var(--border));
+    border-radius: 3px;
+  }
+  .scrollbar-custom::-webkit-scrollbar-thumb:hover {
+    background-color: hsl(var(--muted-foreground));
+  }
+}
