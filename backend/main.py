@@ -14,26 +14,29 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
 app = FastAPI()
 
+# NOTE:
+#  - Don't put trailing "/" in origins
+#  - Add your Vercel frontend here
 origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
-    "https://grammar-correction-ai-by-shahid.vercel.app/",
-    "http://localhost:5173",
+    "https://grammar-correction-ai-by-shahid.vercel.app",
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=origins,      # for quick testing you can use ["*"]
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # -------------------------------------------------
-# LanguageTool (grammar)
+# LanguageTool (grammar) - using PUBLIC API
 # -------------------------------------------------
 
-tool = language_tool_python.LanguageTool("en-US")
+# This version does NOT require Java. It calls LanguageTool's public HTTP API.
+tool = language_tool_python.LanguageToolPublicAPI("en-US")
 
 
 class TextRequest(BaseModel):
@@ -46,9 +49,14 @@ def simple_correct(text: str, mode: str = "grammar"):
     if not updated:
         return "", "No text provided."
 
-    # 1) Grammar + spelling
-    matches = tool.check(updated)
-    updated = language_tool_python.utils.correct(updated, matches)
+    # 1) Grammar + spelling via LanguageTool
+    try:
+        matches = tool.check(updated)
+        updated = language_tool_python.utils.correct(updated, matches)
+        lt_used = True
+    except Exception:
+        # If LanguageTool public API fails, don't crash the whole backend
+        lt_used = False
 
     # 2) Capitalize first letter
     updated = updated.strip()
@@ -74,7 +82,14 @@ def simple_correct(text: str, mode: str = "grammar"):
     elif mode == "casual":
         updated = updated.replace(" sir", " bro")
 
-    summary = f"Grammar and spelling corrected using LanguageTool with {mode} style."
+    if lt_used:
+        summary = f"Grammar and spelling corrected using LanguageTool with {mode} style."
+    else:
+        summary = (
+            f"Basic cleanup applied with {mode} style. "
+            "LanguageToolPublicAPI was not available at the moment."
+        )
+
     return updated, summary
 
 
@@ -98,11 +113,15 @@ def correct_text(body: TextRequest):
         "changesSummary": summary,
     }
 
+
 # -------------------------------------------------
 # Smart Rewrite v3 – offline T5 paraphraser
 # -------------------------------------------------
 
-PARA_MODEL_NAME = "google/flan-t5-large"  # or the model you prefer
+# NOTE:
+# flan-t5-large is heavy and may crash on small Render instances.
+# You can try flan-t5-base which uses less memory.
+PARA_MODEL_NAME = "google/flan-t5-base"  # change back to flan-t5-large if your instance can handle it
 
 para_tokenizer = AutoTokenizer.from_pretrained(PARA_MODEL_NAME)
 para_model = AutoModelForSeq2SeqLM.from_pretrained(PARA_MODEL_NAME)
@@ -185,7 +204,7 @@ def polish_ai(body: AIRewriteRequest):
         f"'{body.tone}' tone and '{body.style}' writing style."
     )
 
-    # IMPORTANT – frontend expects correctedText
+    # frontend expects correctedText
     return {
         "correctedText": polished_text,
         "changesSummary": summary,
