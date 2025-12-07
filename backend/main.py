@@ -6,6 +6,7 @@ from typing import Optional
 import os
 import requests
 import language_tool_python
+from language_tool_python.exceptions import RateLimitError
 
 # ---------------------------
 # FastAPI app + CORS
@@ -37,27 +38,70 @@ def read_root():
 
 
 # ---------------------------
-# Grammar tool (LanguageTool)
+# Grammar tool (LanguageTool Public API)
 # ---------------------------
-tool = language_tool_python.LanguageTool("en-US")
+
+# We use the PUBLIC API so we don't need Java or local server.
+# Make it lazy + safe so rate limits don't crash the app.
+
+_lt_tool = None  # cached client instance
+
+
+def get_language_tool():
+    """
+    Lazily create/return LanguageToolPublicAPI client.
+
+    If rate-limited or any other error occurs, return None.
+    """
+    global _lt_tool
+    if _lt_tool is not None:
+        return _lt_tool
+
+    try:
+        _lt_tool = language_tool_python.LanguageToolPublicAPI("en-US")
+        return _lt_tool
+    except RateLimitError:
+        print("LanguageToolPublicAPI rate limit hit during init.")
+        _lt_tool = None
+        return None
+    except Exception as e:
+        print("LanguageToolPublicAPI init error:", e)
+        _lt_tool = None
+        return None
 
 
 def apply_language_tool(text: str) -> str:
     """
-    Basic grammar + spelling correction using LanguageTool.
+    Basic grammar + spelling correction using LanguageToolPublicAPI.
+    Falls back to original text if API not available.
     """
-    matches = tool.check(text)
-    corrected = language_tool_python.utils.correct(text, matches)
-    return corrected.strip()
+    tool = get_language_tool()
+    cleaned = text.strip()
+    if not cleaned:
+        return ""
+
+    if tool is None:
+        # No tool available (rate limit / network) – just return original
+        return cleaned
+
+    try:
+        matches = tool.check(cleaned)
+        corrected = language_tool_python.utils.correct(cleaned, matches)
+        return corrected.strip()
+    except RateLimitError:
+        print("LanguageToolPublicAPI rate limit hit during check().")
+        return cleaned
+    except Exception as e:
+        print("LanguageToolPublicAPI error:", e)
+        return cleaned
 
 
 # ---------------------------
 # Hugging Face config (Smart Rewrite v3)
 # ---------------------------
 
-# You can swap the model later if you want
 HF_API_URL = "https://api-inference.huggingface.co/models/google/flan-t5-base"
-HF_API_TOKEN = os.getenv("HF_API_TOKEN")  # set this in your hosting env, NOT in code
+HF_API_TOKEN = os.getenv("HF_API_TOKEN")  # set this in hosting env
 
 
 def build_hf_prompt(text: str, tone: str, style: str) -> str:
@@ -101,7 +145,6 @@ def call_hf_rewrite(prompt: str, fallback: str) -> tuple[str, bool]:
     Returns (text, used_hf) where used_hf=False means we fell back.
     """
     if not HF_API_TOKEN:
-        # token not configured: fall back to grammared text
         print("HF_API_TOKEN not set; using fallback text.")
         return fallback, False
 
@@ -113,7 +156,6 @@ def call_hf_rewrite(prompt: str, fallback: str) -> tuple[str, bool]:
         resp.raise_for_status()
         data = resp.json()
 
-        # Flan-T5 via inference API usually returns: [{"generated_text": "..."}]
         generated = None
         if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
             generated = data[0].get("generated_text")
@@ -125,31 +167,24 @@ def call_hf_rewrite(prompt: str, fallback: str) -> tuple[str, bool]:
             return fallback, False
 
         text = generated.strip()
-
-        # Try to cut off instructions if model echoes them
         lower = text.lower()
 
-        # If it contains "rewritten:", keep only text after last occurrence
+        # Cut off instructions if model echoes them
         if "rewritten:" in lower:
             idx = lower.rfind("rewritten:")
             text = text[idx + len("rewritten:") :].strip()
-        else:
-            # If it still contains the original "Text:" block, try to keep after it
-            if "text:" in lower:
-                idx = lower.rfind("text:")
-                tail = text[idx + len("text:") :].strip()
-                # use tail only if shorter than whole thing (to avoid weird cuts)
-                if 0 < len(tail) < len(text):
-                    text = tail
+        elif "text:" in lower:
+            idx = lower.rfind("text:")
+            tail = text[idx + len("text:") :].strip()
+            if 0 < len(tail) < len(text):
+                text = tail
 
-        # Basic cleanup
         text = " ".join(text.split())
         if text and text[0].isalpha():
             text = text[0].upper() + text[1:]
         if text and text[-1] not in ".!?":
             text += "."
 
-        # If somehow empty after cleanup, fall back
         if not text:
             return fallback, False
 
@@ -223,15 +258,13 @@ def simple_correct(text: str, mode: str = "grammar"):
     corrected = apply_language_tool(cleaned)
     corrected = basic_tone_adjust(corrected, mode)
 
-    # Capitalize first letter
     if corrected:
         corrected = corrected[0].upper() + corrected[1:]
 
-    # Ensure punctuation
     if corrected and corrected[-1] not in ".!?":
         corrected += "."
 
-    summary = f"Grammar and spelling corrected using LanguageTool with {mode} style."
+    summary = f"Grammar and spelling corrected using LanguageToolPublicAPI with {mode} style."
     return corrected, summary
 
 
@@ -264,7 +297,6 @@ def polish_ai(body: AIRewriteRequest):
     1) Grammar pass
     2) AI paraphrase with tone + style via Hugging Face
     """
-
     raw = body.text.strip()
     if not raw:
         return {
@@ -272,10 +304,8 @@ def polish_ai(body: AIRewriteRequest):
             "changesSummary": "No text provided.",
         }
 
-    # Step 1 – basic grammar cleanup first
     grammared, _ = simple_correct(raw, "grammar")
 
-    # Step 2 – AI paraphrase with tone + style
     tone = (body.tone or "friendly").lower()
     style = (body.style or "neutral").lower()
 
@@ -292,9 +322,8 @@ def polish_ai(body: AIRewriteRequest):
         )
     else:
         summary = (
-            f"Basic rewrite applied using grammar correction only; "
-            f"Hugging Face model was not available. "
-            f"Tone: '{tone_label}', Style: '{style_label}'."
+            "Basic rewrite applied using grammar correction only; "
+            f"Hugging Face model was not available. Tone: '{tone_label}', Style: '{style_label}'."
         )
 
     return {
