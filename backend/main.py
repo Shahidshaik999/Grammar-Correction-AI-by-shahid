@@ -6,6 +6,7 @@ from typing import Optional
 import os
 import requests
 import language_tool_python
+from language_tool_python.exceptions import RateLimitError
 
 # ---------------------------
 # FastAPI app + CORS
@@ -37,18 +38,34 @@ def read_root():
 
 
 # ---------------------------
-# Grammar tool (LanguageTool)
+# Grammar tool (LanguageTool Public API)
 # ---------------------------
-tool = language_tool_python.LanguageTool("en-US")
+
+_lt_tool = None  # cached instance
 
 
-def apply_language_tool(text: str) -> str:
+def get_language_tool():
     """
-    Basic grammar + spelling correction using LanguageTool.
+    Lazily create the LanguageToolPublicAPI client.
+
+    If rate-limited or any error occurs, return None so that
+    the backend still runs and deploy never fails.
     """
-    matches = tool.check(text)
-    corrected = language_tool_python.utils.correct(text, matches)
-    return corrected.strip()
+    global _lt_tool
+    if _lt_tool is not None:
+        return _lt_tool
+
+    try:
+        _lt_tool = language_tool_python.LanguageToolPublicAPI("en-US")
+        return _lt_tool
+    except RateLimitError as e:
+        print("LanguageToolPublicAPI rate limit:", e)
+        _lt_tool = None
+        return None
+    except Exception as e:
+        print("LanguageToolPublicAPI error:", e)
+        _lt_tool = None
+        return None
 
 
 # ---------------------------
@@ -200,15 +217,32 @@ def basic_tone_adjust(text: str, mode: str) -> str:
 def simple_correct(text: str, mode: str = "grammar"):
     """
     Grammar + spelling correction + light tone.
+    Uses LanguageToolPublicAPI when available, falls back gracefully otherwise.
     """
     cleaned = text.strip()
     if not cleaned:
         return "", "No text provided."
 
-    corrected = apply_language_tool(cleaned)
+    lt_used = False
+    tool = get_language_tool()
+
+    corrected = cleaned
+    if tool is not None:
+        try:
+            matches = tool.check(cleaned)
+            corrected = language_tool_python.utils.correct(cleaned, matches)
+            lt_used = True
+        except RateLimitError as e:
+            print("LanguageToolPublicAPI rate limit during check:", e)
+            lt_used = False
+        except Exception as e:
+            print("LanguageToolPublicAPI error during check:", e)
+            lt_used = False
+
     corrected = basic_tone_adjust(corrected, mode)
 
     # Capitalize first letter
+    corrected = corrected.strip()
     if corrected:
         corrected = corrected[0].upper() + corrected[1:]
 
@@ -216,7 +250,14 @@ def simple_correct(text: str, mode: str = "grammar"):
     if corrected and corrected[-1] not in ".!?":
         corrected += "."
 
-    summary = f"Grammar and spelling corrected using LanguageTool with {mode} style."
+    if lt_used:
+        summary = f"Grammar and spelling corrected using LanguageToolPublicAPI with {mode} style."
+    else:
+        summary = (
+            f"Basic cleanup applied with {mode} style. "
+            "LanguageToolPublicAPI was not available (rate limit or network error)."
+        )
+
     return corrected, summary
 
 
