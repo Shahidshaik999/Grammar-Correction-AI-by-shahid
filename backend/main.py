@@ -57,7 +57,7 @@ def apply_language_tool(text: str) -> str:
 
 # You can change the model later if you want
 HF_API_URL = "https://api-inference.huggingface.co/models/google/flan-t5-base"
-HF_API_TOKEN = os.getenv("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")
+HF_API_TOKEN = os.getenv("HF_API_TOKEN")
 
 
 def build_hf_prompt(text: str, tone: str, style: str) -> str:
