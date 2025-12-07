@@ -16,13 +16,11 @@ origins = [
     "http://127.0.0.1:5173",
     "http://localhost:8080",
     "http://127.0.0.1:8080",
-    # 🔴 your deployed frontend URL (Vercel)
-    "https://grammar-correction-ai-by-shahid.vercel.app",
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,   # you can use ["*"] while testing if needed
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

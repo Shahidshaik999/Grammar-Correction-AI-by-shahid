@@ -16,10 +16,7 @@ export type StyleProfile =
   | "ielts"
   | "romantic";
 
-// 🔴 Use your deployed backend URL here
-const BACKEND_BASE = "https://grammar-correction-ai-by-shahid.onrender.com";
-// For local testing, you can temporarily change this back to:
-// const BACKEND_BASE = "http://localhost:8000";
+const BACKEND_BASE = "http://localhost:8000";
 
 export async function polishText(text: string, mode: Mode = "grammar") {
   try {
