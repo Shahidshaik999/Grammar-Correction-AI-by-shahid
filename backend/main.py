@@ -6,7 +6,6 @@ from typing import Optional
 import os
 import requests
 import language_tool_python
-from language_tool_python.exceptions import RateLimitError
 
 # ---------------------------
 # FastAPI app + CORS
@@ -25,7 +24,7 @@ origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,  # for testing, you could temporarily use ["*"]
+    allow_origins=origins,  # for debugging you could use ["*"]
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -38,49 +37,32 @@ def read_root():
 
 
 # ---------------------------
-# Grammar tool (LanguageTool Public API)
+# Grammar tool (LanguageTool)
 # ---------------------------
+tool = language_tool_python.LanguageTool("en-US")
 
-_lt_tool = None  # cached instance
 
-
-def get_language_tool():
+def apply_language_tool(text: str) -> str:
     """
-    Lazily create the LanguageToolPublicAPI client.
-
-    If rate-limited or any error occurs, return None so that
-    the backend still runs and deploy never fails.
+    Basic grammar + spelling correction using LanguageTool.
     """
-    global _lt_tool
-    if _lt_tool is not None:
-        return _lt_tool
-
-    try:
-        _lt_tool = language_tool_python.LanguageToolPublicAPI("en-US")
-        return _lt_tool
-    except RateLimitError as e:
-        print("LanguageToolPublicAPI rate limit:", e)
-        _lt_tool = None
-        return None
-    except Exception as e:
-        print("LanguageToolPublicAPI error:", e)
-        _lt_tool = None
-        return None
+    matches = tool.check(text)
+    corrected = language_tool_python.utils.correct(text, matches)
+    return corrected.strip()
 
 
 # ---------------------------
-# Hugging Face config (for rewrite)
+# Hugging Face config (Smart Rewrite v3)
 # ---------------------------
 
-# You can change the model later if you want
+# You can swap the model later if you want
 HF_API_URL = "https://api-inference.huggingface.co/models/google/flan-t5-base"
-HF_API_TOKEN = os.getenv("HF_API_TOKEN")
+HF_API_TOKEN = os.getenv("HF_API_TOKEN")  # set this in your hosting env, NOT in code
 
 
 def build_hf_prompt(text: str, tone: str, style: str) -> str:
     """
-    Build the same style of instruction you used for Smart Rewrite v3,
-    but now for a Hugging Face text2text model.
+    Build instruction prompt for a text2text model (Flan-T5 style).
     """
     tone_instruction_map = {
         "friendly": "in a warm, friendly tone",
@@ -113,25 +95,25 @@ def build_hf_prompt(text: str, tone: str, style: str) -> str:
     return instruction
 
 
-def call_hf_rewrite(prompt: str) -> str:
+def call_hf_rewrite(prompt: str, fallback: str) -> tuple[str, bool]:
     """
-    Calls Hugging Face Inference API with the given prompt.
-    Falls back gracefully if something goes wrong.
+    Call Hugging Face Inference API.
+    Returns (text, used_hf) where used_hf=False means we fell back.
     """
-    # If token not set, just return prompt tail (so app doesn't crash)
     if not HF_API_TOKEN:
-        print("HF_API_TOKEN not set; returning prompt as fallback.")
-        return prompt
+        # token not configured: fall back to grammared text
+        print("HF_API_TOKEN not set; using fallback text.")
+        return fallback, False
 
     headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
     payload = {"inputs": prompt}
 
     try:
-        resp = requests.post(HF_API_URL, headers=headers, json=payload, timeout=30)
+        resp = requests.post(HF_API_URL, headers=headers, json=payload, timeout=40)
         resp.raise_for_status()
         data = resp.json()
 
-        # For text2text models, HF usually returns a list of dicts with "generated_text"
+        # Flan-T5 via inference API usually returns: [{"generated_text": "..."}]
         generated = None
         if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
             generated = data[0].get("generated_text")
@@ -139,13 +121,26 @@ def call_hf_rewrite(prompt: str) -> str:
             generated = data["generated_text"]
 
         if not generated:
-            generated = str(data)
+            print("HF response format unexpected, using fallback.")
+            return fallback, False
 
         text = generated.strip()
 
-        # Remove a possible "Rewritten:" prefix
-        if text.lower().startswith("rewritten:"):
-            text = text[len("rewritten:") :].strip()
+        # Try to cut off instructions if model echoes them
+        lower = text.lower()
+
+        # If it contains "rewritten:", keep only text after last occurrence
+        if "rewritten:" in lower:
+            idx = lower.rfind("rewritten:")
+            text = text[idx + len("rewritten:") :].strip()
+        else:
+            # If it still contains the original "Text:" block, try to keep after it
+            if "text:" in lower:
+                idx = lower.rfind("text:")
+                tail = text[idx + len("text:") :].strip()
+                # use tail only if shorter than whole thing (to avoid weird cuts)
+                if 0 < len(tail) < len(text):
+                    text = tail
 
         # Basic cleanup
         text = " ".join(text.split())
@@ -154,11 +149,15 @@ def call_hf_rewrite(prompt: str) -> str:
         if text and text[-1] not in ".!?":
             text += "."
 
-        return text
+        # If somehow empty after cleanup, fall back
+        if not text:
+            return fallback, False
+
+        return text, True
+
     except Exception as e:
         print("Hugging Face API error:", e)
-        # Fallback: return original prompt on error so endpoint still works
-        return prompt
+        return fallback, False
 
 
 # ---------------------------
@@ -184,8 +183,7 @@ class AIRewriteRequest(BaseModel):
 
 def basic_tone_adjust(text: str, mode: str) -> str:
     """
-    Very light tone adjust for /correct endpoint
-    (keep this simple, most magic comes from AI endpoint).
+    Very light tone adjust for /correct endpoint.
     """
     updated = text
 
@@ -217,32 +215,15 @@ def basic_tone_adjust(text: str, mode: str) -> str:
 def simple_correct(text: str, mode: str = "grammar"):
     """
     Grammar + spelling correction + light tone.
-    Uses LanguageToolPublicAPI when available, falls back gracefully otherwise.
     """
     cleaned = text.strip()
     if not cleaned:
         return "", "No text provided."
 
-    lt_used = False
-    tool = get_language_tool()
-
-    corrected = cleaned
-    if tool is not None:
-        try:
-            matches = tool.check(cleaned)
-            corrected = language_tool_python.utils.correct(cleaned, matches)
-            lt_used = True
-        except RateLimitError as e:
-            print("LanguageToolPublicAPI rate limit during check:", e)
-            lt_used = False
-        except Exception as e:
-            print("LanguageToolPublicAPI error during check:", e)
-            lt_used = False
-
+    corrected = apply_language_tool(cleaned)
     corrected = basic_tone_adjust(corrected, mode)
 
     # Capitalize first letter
-    corrected = corrected.strip()
     if corrected:
         corrected = corrected[0].upper() + corrected[1:]
 
@@ -250,14 +231,7 @@ def simple_correct(text: str, mode: str = "grammar"):
     if corrected and corrected[-1] not in ".!?":
         corrected += "."
 
-    if lt_used:
-        summary = f"Grammar and spelling corrected using LanguageToolPublicAPI with {mode} style."
-    else:
-        summary = (
-            f"Basic cleanup applied with {mode} style. "
-            "LanguageToolPublicAPI was not available (rate limit or network error)."
-        )
-
+    summary = f"Grammar and spelling corrected using LanguageTool with {mode} style."
     return corrected, summary
 
 
@@ -306,17 +280,26 @@ def polish_ai(body: AIRewriteRequest):
     style = (body.style or "neutral").lower()
 
     prompt = build_hf_prompt(grammared, tone, style)
-    rewritten = call_hf_rewrite(prompt)
+    rewritten, used_hf = call_hf_rewrite(prompt, fallback=grammared)
 
-    # Build human-readable summary
     tone_label = tone.capitalize()
     style_label = style.capitalize()
-    summary = (
-        f"Expression adjusted using Smart Rewrite v3 (Hugging Face) "
-        f"with '{tone_label}' tone and '{style_label}' writing style."
-    )
+
+    if used_hf:
+        summary = (
+            f"Expression adjusted using Smart Rewrite v3 (Hugging Face) "
+            f"with '{tone_label}' tone and '{style_label}' writing style."
+        )
+    else:
+        summary = (
+            f"Basic rewrite applied using grammar correction only; "
+            f"Hugging Face model was not available. "
+            f"Tone: '{tone_label}', Style: '{style_label}'."
+        )
 
     return {
         "correctedText": rewritten,
         "changesSummary": summary,
+        "appliedTone": tone,
+        "appliedStyle": style,
     }
