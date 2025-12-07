@@ -2,9 +2,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
+import re
 
-import os
-import requests
 import language_tool_python
 
 app = FastAPI()
@@ -15,8 +14,6 @@ origins = [
     "http://127.0.0.1:5173",
     "http://localhost:8080",
     "http://127.0.0.1:8080",
-    # deployed frontend (add yours here)
-    "https://grammar-correction-ai-by-shahid.vercel.app",
 ]
 
 app.add_middleware(
@@ -37,63 +34,6 @@ def read_root():
 tool = language_tool_python.LanguageTool("en-US")
 
 
-# ---------- Hugging Face paraphrase model (remote) ----------
-
-# You can change this if you want another model later
-HF_API_URL = "https://api-inference.huggingface.co/models/Vamsi/T5_Paraphrase_Paws"
-HF_API_TOKEN = os.getenv("HF_API_TOKEN")  # set this in Render / server env, NOT in code
-
-
-def generate_paraphrase(text: str, prompt_prefix: str) -> str:
-    """
-    Helper to generate paraphrase with a certain prompt style,
-    using Hugging Face Inference API instead of local T5.
-    """
-    base = text.strip()
-    if not base:
-        return ""
-
-    # If token not configured, just return the original text
-    if not HF_API_TOKEN:
-        print("HF_API_TOKEN not set; returning original text.")
-        return base
-
-    full_input = f"{prompt_prefix} {base}"
-
-    headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
-    payload = {"inputs": full_input}
-
-    try:
-        resp = requests.post(HF_API_URL, headers=headers, json=payload, timeout=40)
-        resp.raise_for_status()
-        data = resp.json()
-
-        # Typical HF text2text output: [{"generated_text": "..."}]
-        generated = None
-        if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
-            generated = data[0].get("generated_text")
-        elif isinstance(data, dict) and "generated_text" in data:
-            generated = data["generated_text"]
-
-        if not generated:
-            print("Unexpected HF response format, falling back to original.")
-            return base
-
-        out = generated.strip()
-        # Basic cleanup
-        out = " ".join(out.split())
-        if out and out[0].isalpha():
-            out = out[0].upper() + out[1:]
-        if out and out[-1] not in ".!?":
-            out += "."
-
-        return out or base
-    except Exception as e:
-        print("Hugging Face API error:", e)
-        # On error, fall back to original text
-        return base
-
-
 # ---------- Request Models ----------
 
 class TextRequest(BaseModel):
@@ -110,6 +50,129 @@ class ToneRequest(BaseModel):
     tone: str  # "friendly" | "professional" | "confident" | "calm" | "caring" | "persuasive"
 
 
+# ---------- Helpers ----------
+
+def normalize_spaces(text: str) -> str:
+    return " ".join(text.split())
+
+
+def split_sentences(text: str):
+    """
+    Split text into sentences, keeping punctuation.
+    Very simple splitter, but enough for our use-case.
+    """
+    parts = re.split(r"([.!?])", text)
+    sentences = []
+    current = ""
+
+    for part in parts:
+        if not part:
+            continue
+        if part in ".!?":
+            current += part
+            sentences.append(current.strip())
+            current = ""
+        else:
+            current += part
+
+    if current.strip():
+        sentences.append(current.strip())
+
+    return sentences
+
+
+def smart_rewrite_sentence(sentence: str) -> str:
+    """
+    Smart Rewrite v2:
+    - Softly improve flow
+    - Remove weak phrases
+    - Improve connectors
+    - Make subject-pronoun usage more natural
+    """
+
+    s = sentence.strip()
+
+    # Basic: ensure single spaces
+    s = normalize_spaces(s)
+
+    # Fix lowercase "i" to "I"
+    s = re.sub(r"\bi\b", "I", s)
+
+    # 1) Weak phrase cleanup
+    weak_map = {
+        "I think that ": "",
+        "I think ": "",
+        "maybe ": "",
+        "probably ": "",
+        "kind of ": "",
+        "sort of ": "",
+        "a little bit ": "a bit ",
+    }
+    for k, v in weak_map.items():
+        s = s.replace(k, v)
+
+    # 2) Tense / phrasing smoothing
+    replacements = {
+        "I want to tell him that": "I wanted to let him know that",
+        "I want to tell her that": "I wanted to let her know that",
+        "I want to tell them that": "I wanted to let them know that",
+        "I want to tell you that": "I wanted to let you know that",
+        "I want to tell that": "I wanted to explain that",
+        "I want to explain him": "I wanted to explain to him",
+        "I want to explain her": "I wanted to explain to her",
+        "I want to explain them": "I wanted to explain to them",
+        "I will try to": "I will",
+        "I will try": "I will",
+        "very very": "very",
+    }
+    for k, v in replacements.items():
+        s = s.replace(k, v)
+
+    # 3) Start-of-sentence connectors
+    s_strip_lower = s.lower().lstrip()
+
+    if s_strip_lower.startswith("but "):
+        # "But later I..." -> "However, later I..."
+        s = re.sub(r"^but\s+", "However, ", s, flags=re.IGNORECASE)
+    elif s_strip_lower.startswith("and "):
+        s = re.sub(r"^and\s+", "", s, flags=re.IGNORECASE)
+    elif s_strip_lower.startswith("so "):
+        s = re.sub(r"^so\s+", "As a result, ", s, flags=re.IGNORECASE)
+    elif s_strip_lower.startswith("then "):
+        s = re.sub(r"^then\s+", "Then, ", s, flags=re.IGNORECASE)
+    elif s_strip_lower.startswith("later "):
+        # "later I realized" -> "Later, I realised"
+        s = re.sub(r"^later\s+", "Later, ", s, flags=re.IGNORECASE)
+
+    return s
+
+
+def smart_rewrite(text: str) -> str:
+    """
+    Smart Rewrite v2 over the whole paragraph.
+    1) Split into sentences
+    2) Improve each sentence
+    3) Join them back with nice spacing
+    """
+    text = normalize_spaces(text)
+    sentences = split_sentences(text)
+
+    improved = []
+    last = ""
+
+    for sent in sentences:
+        new_s = smart_rewrite_sentence(sent)
+
+        # Avoid exact duplicates back-to-back
+        if new_s == last:
+            continue
+
+        improved.append(new_s)
+        last = new_s
+
+    return " ".join(improved)
+
+
 # ---------- Core Grammar Correction ----------
 
 def simple_correct(text: str, mode: str = "grammar"):
@@ -121,7 +184,7 @@ def simple_correct(text: str, mode: str = "grammar"):
     matches = tool.check(updated)
     updated = language_tool_python.utils.correct(updated, matches)
 
-    # 2) Capitalize first letter
+    # 2) Capitalize first letter of the whole text
     updated = updated.strip()
     if updated:
         updated = updated[0].upper() + updated[1:]
@@ -130,15 +193,16 @@ def simple_correct(text: str, mode: str = "grammar"):
     if updated and updated[-1] not in ".!?":
         updated += "."
 
-    # 4) Tone changes (very light rules)
+    # 4) Simple tone changes (light rules)
     if mode == "professional":
         pro_replacements = {
-            " bro": " sir",
+            " bro": "",
             " gonna": " going to",
             " wanna": " want to",
             " pls": " please",
             " don't": " do not",
             " can't": " cannot",
+            " ok ": " okay ",
         }
         for wrong, right in pro_replacements.items():
             updated = updated.replace(wrong, right)
@@ -147,8 +211,62 @@ def simple_correct(text: str, mode: str = "grammar"):
         updated = updated.replace(" sir", " bro")
 
     summary = f"Grammar and spelling corrected using LanguageTool with {mode} style."
-
     return updated, summary
+
+
+# ---------- Tone Rewriter (rule-based) ----------
+
+def apply_tone(text: str, tone: str) -> str:
+    t = tone.lower()
+    result = normalize_spaces(text)
+
+    if t == "friendly":
+        result = result.replace("Regards,", "Cheers,")
+        result = result.replace("regards,", "cheers,")
+        if not result.lower().startswith(("hi", "hello", "hey")):
+            result = "Hi, " + result
+    elif t == "professional":
+        replacements = {
+            " bro": "",
+            " dude": "",
+            " guys": " everyone",
+            "yeah": "yes",
+            " ok": " okay",
+            " ok.": " okay.",
+            " okay bro": " okay",
+        }
+        for wrong, right in replacements.items():
+            result = result.replace(wrong, right)
+    elif t == "confident":
+        weak_phrases = [
+            "I think ",
+            "maybe ",
+            "probably ",
+            "I am not sure but ",
+        ]
+        for w in weak_phrases:
+            result = result.replace(w, "")
+        result = result.replace("I will try to", "I will")
+        result = result.replace("I will try", "I will")
+    elif t == "calm":
+        strong_to_calm = {
+            "I am tired of": "I am concerned about",
+            "I am very angry": "I am quite upset",
+            "this is unacceptable": "this is not ideal",
+            "you never": "you rarely",
+            "you always": "you often",
+        }
+        for k, v in strong_to_calm.items():
+            result = result.replace(k, v)
+    elif t == "caring":
+        if not result.lower().startswith(("i understand", "I understand")):
+            result = "I understand how you feel. " + result
+        if "sorry" not in result.lower():
+            result += " I am here for you and I truly care."
+    elif t == "persuasive":
+        if "because" not in result.lower():
+            result += " This will really help us move forward because it makes things clearer."
+    return result
 
 
 # ---------- /correct ----------
@@ -170,7 +288,7 @@ def correct_text(body: TextRequest):
     }
 
 
-# ---------- /polish-ai (fluent rewrite) ----------
+# ---------- /polish-ai (Smart Rewrite v2) ----------
 
 @app.post("/polish-ai")
 def polish_ai(body: AIRequest):
@@ -181,32 +299,19 @@ def polish_ai(body: AIRequest):
             "changesSummary": "No text provided.",
         }
 
-    # Step 1: grammar
+    # Step 1: fix grammar + spelling
     corrected, _ = simple_correct(base, "grammar")
 
-    # Step 2: fluent paraphrase via Hugging Face
-    fluent = generate_paraphrase(
-        corrected,
-        "paraphrase this to be more clear and fluent:",
-    )
+    # Step 2: Smart Rewrite v2 to improve fluency
+    fluent = smart_rewrite(corrected)
 
     return {
         "correctedText": fluent,
-        "changesSummary": "Grammar and spelling corrected, then paraphrased using Hugging Face for more fluent English.",
+        "changesSummary": "Grammar corrected and refined with Smart Rewrite v2 for more natural English.",
     }
 
 
-# ---------- /rewrite-tone ----------
-
-TONE_PROMPTS = {
-    "friendly": "paraphrase this in a warm and friendly tone:",
-    "professional": "paraphrase this in a polite and professional tone:",
-    "confident": "paraphrase this in a confident and assertive tone:",
-    "calm": "paraphrase this in a calm and respectful tone, softening any anger:",
-    "caring": "paraphrase this in a caring and supportive tone:",
-    "persuasive": "paraphrase this in a clear and persuasive tone:",
-}
-
+# ---------- /rewrite-tone (uses Smart Rewrite too) ----------
 
 @app.post("/rewrite-tone")
 def rewrite_tone(body: ToneRequest):
@@ -217,15 +322,12 @@ def rewrite_tone(body: ToneRequest):
             "changesSummary": "No text provided.",
         }
 
-    tone_key = body.tone.lower()
-    prompt = TONE_PROMPTS.get(
-        tone_key,
-        "paraphrase this clearly and naturally:",
-    )
-
-    toned_text = generate_paraphrase(base, prompt)
+    # First, make it fluent
+    fluent = smart_rewrite(base)
+    # Then apply tone
+    toned_text = apply_tone(fluent, body.tone)
 
     return {
         "correctedText": toned_text,
-        "changesSummary": f"Expression improved using AI with '{tone_key}' tone.",
+        "changesSummary": f"Expression adjusted towards '{body.tone}' tone using Smart Rewrite v2.",
     }
