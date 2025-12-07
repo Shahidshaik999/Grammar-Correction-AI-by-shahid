@@ -6,156 +6,69 @@ from typing import Optional
 import os
 import requests
 import language_tool_python
-from language_tool_python.exceptions import RateLimitError
 
-# ---------------------------
-# FastAPI app + CORS
-# ---------------------------
 app = FastAPI()
 
+# ---------- CORS ----------
 origins = [
-    # Local dev
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "http://localhost:8080",
     "http://127.0.0.1:8080",
-    # Deployed frontend (Vercel)
+    # deployed frontend (add yours here)
     "https://grammar-correction-ai-by-shahid.vercel.app",
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,  # for debugging you could use ["*"]
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
+# ---------- Root ----------
 @app.get("/")
 def read_root():
     return {"message": "TypePolish backend running"}
 
 
-# ---------------------------
-# Grammar tool (LanguageTool Public API)
-# ---------------------------
-
-# We use the PUBLIC API so we don't need Java or local server.
-# Make it lazy + safe so rate limits don't crash the app.
-
-_lt_tool = None  # cached client instance
+# ---------- Grammar Tool ----------
+tool = language_tool_python.LanguageTool("en-US")
 
 
-def get_language_tool():
+# ---------- Hugging Face paraphrase model (remote) ----------
+
+# You can change this if you want another model later
+HF_API_URL = "https://api-inference.huggingface.co/models/Vamsi/T5_Paraphrase_Paws"
+HF_API_TOKEN = os.getenv("HF_API_TOKEN")  # set this in Render / server env, NOT in code
+
+
+def generate_paraphrase(text: str, prompt_prefix: str) -> str:
     """
-    Lazily create/return LanguageToolPublicAPI client.
-
-    If rate-limited or any other error occurs, return None.
+    Helper to generate paraphrase with a certain prompt style,
+    using Hugging Face Inference API instead of local T5.
     """
-    global _lt_tool
-    if _lt_tool is not None:
-        return _lt_tool
-
-    try:
-        _lt_tool = language_tool_python.LanguageToolPublicAPI("en-US")
-        return _lt_tool
-    except RateLimitError:
-        print("LanguageToolPublicAPI rate limit hit during init.")
-        _lt_tool = None
-        return None
-    except Exception as e:
-        print("LanguageToolPublicAPI init error:", e)
-        _lt_tool = None
-        return None
-
-
-def apply_language_tool(text: str) -> str:
-    """
-    Basic grammar + spelling correction using LanguageToolPublicAPI.
-    Falls back to original text if API not available.
-    """
-    tool = get_language_tool()
-    cleaned = text.strip()
-    if not cleaned:
+    base = text.strip()
+    if not base:
         return ""
 
-    if tool is None:
-        # No tool available (rate limit / network) – just return original
-        return cleaned
-
-    try:
-        matches = tool.check(cleaned)
-        corrected = language_tool_python.utils.correct(cleaned, matches)
-        return corrected.strip()
-    except RateLimitError:
-        print("LanguageToolPublicAPI rate limit hit during check().")
-        return cleaned
-    except Exception as e:
-        print("LanguageToolPublicAPI error:", e)
-        return cleaned
-
-
-# ---------------------------
-# Hugging Face config (Smart Rewrite v3)
-# ---------------------------
-
-HF_API_URL = "https://api-inference.huggingface.co/models/google/flan-t5-base"
-HF_API_TOKEN = os.getenv("HF_API_TOKEN")  # set this in hosting env
-
-
-def build_hf_prompt(text: str, tone: str, style: str) -> str:
-    """
-    Build instruction prompt for a text2text model (Flan-T5 style).
-    """
-    tone_instruction_map = {
-        "friendly": "in a warm, friendly tone",
-        "professional": "in a clear and professional tone",
-        "confident": "in a confident, self-assured tone",
-        "calm": "in a calm and composed tone",
-        "caring": "in a caring and supportive tone",
-        "persuasive": "in a persuasive and encouraging tone",
-        "neutral": "in a neutral tone",
-    }
-
-    style_instruction_map = {
-        "neutral": "with normal everyday English",
-        "student": "with simple, clear English suitable for a college student",
-        "corporate": "with formal business email style",
-        "ielts": "with IELTS-style academic English",
-        "romantic": "with soft and gentle wording, but still respectful",
-    }
-
-    tone_part = tone_instruction_map.get(tone, "in a neutral tone")
-    style_part = style_instruction_map.get(style, "with normal everyday English")
-
-    instruction = (
-        f"Paraphrase the following text {tone_part} and {style_part}. "
-        "Keep the original meaning and person the same. "
-        "Use natural, fluent sentences and split long sentences if needed.\n\n"
-        f"Text: {text}\n\n"
-        "Rewritten:"
-    )
-    return instruction
-
-
-def call_hf_rewrite(prompt: str, fallback: str) -> tuple[str, bool]:
-    """
-    Call Hugging Face Inference API.
-    Returns (text, used_hf) where used_hf=False means we fell back.
-    """
+    # If token not configured, just return the original text
     if not HF_API_TOKEN:
-        print("HF_API_TOKEN not set; using fallback text.")
-        return fallback, False
+        print("HF_API_TOKEN not set; returning original text.")
+        return base
+
+    full_input = f"{prompt_prefix} {base}"
 
     headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
-    payload = {"inputs": prompt}
+    payload = {"inputs": full_input}
 
     try:
         resp = requests.post(HF_API_URL, headers=headers, json=payload, timeout=40)
         resp.raise_for_status()
         data = resp.json()
 
+        # Typical HF text2text output: [{"generated_text": "..."}]
         generated = None
         if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
             generated = data[0].get("generated_text")
@@ -163,115 +76,82 @@ def call_hf_rewrite(prompt: str, fallback: str) -> tuple[str, bool]:
             generated = data["generated_text"]
 
         if not generated:
-            print("HF response format unexpected, using fallback.")
-            return fallback, False
+            print("Unexpected HF response format, falling back to original.")
+            return base
 
-        text = generated.strip()
-        lower = text.lower()
+        out = generated.strip()
+        # Basic cleanup
+        out = " ".join(out.split())
+        if out and out[0].isalpha():
+            out = out[0].upper() + out[1:]
+        if out and out[-1] not in ".!?":
+            out += "."
 
-        # Cut off instructions if model echoes them
-        if "rewritten:" in lower:
-            idx = lower.rfind("rewritten:")
-            text = text[idx + len("rewritten:") :].strip()
-        elif "text:" in lower:
-            idx = lower.rfind("text:")
-            tail = text[idx + len("text:") :].strip()
-            if 0 < len(tail) < len(text):
-                text = tail
-
-        text = " ".join(text.split())
-        if text and text[0].isalpha():
-            text = text[0].upper() + text[1:]
-        if text and text[-1] not in ".!?":
-            text += "."
-
-        if not text:
-            return fallback, False
-
-        return text, True
-
+        return out or base
     except Exception as e:
         print("Hugging Face API error:", e)
-        return fallback, False
+        # On error, fall back to original text
+        return base
 
 
-# ---------------------------
-# Request models
-# ---------------------------
-
+# ---------- Request Models ----------
 
 class TextRequest(BaseModel):
     text: str
     mode: Optional[str] = "grammar"  # "grammar" | "professional" | "casual"
 
 
-class AIRewriteRequest(BaseModel):
+class AIRequest(BaseModel):
     text: str
-    tone: Optional[str] = "friendly"  # friendly | professional | confident | calm | caring | persuasive | neutral
-    style: Optional[str] = "neutral"  # neutral | student | corporate | ielts | romantic
 
 
-# ---------------------------
-# Core functions
-# ---------------------------
+class ToneRequest(BaseModel):
+    text: str
+    tone: str  # "friendly" | "professional" | "confident" | "calm" | "caring" | "persuasive"
 
 
-def basic_tone_adjust(text: str, mode: str) -> str:
-    """
-    Very light tone adjust for /correct endpoint.
-    """
-    updated = text
+# ---------- Core Grammar Correction ----------
 
+def simple_correct(text: str, mode: str = "grammar"):
+    updated = text.strip()
+    if not updated:
+        return "", "No text provided."
+
+    # 1) Grammar + spelling correction using LanguageTool
+    matches = tool.check(updated)
+    updated = language_tool_python.utils.correct(updated, matches)
+
+    # 2) Capitalize first letter
+    updated = updated.strip()
+    if updated:
+        updated = updated[0].upper() + updated[1:]
+
+    # 3) Ensure ending punctuation
+    if updated and updated[-1] not in ".!?":
+        updated += "."
+
+    # 4) Tone changes (very light rules)
     if mode == "professional":
-        replacements = {
+        pro_replacements = {
             " bro": " sir",
             " gonna": " going to",
             " wanna": " want to",
+            " pls": " please",
             " don't": " do not",
             " can't": " cannot",
-            " won't": " will not",
-            " okay": " all right",
-            " ok": " all right",
         }
-        for w, r in replacements.items():
-            updated = updated.replace(w, r)
+        for wrong, right in pro_replacements.items():
+            updated = updated.replace(wrong, right)
 
     elif mode == "casual":
-        replacements = {
-            "sir": "bro",
-            "madam": "bro",
-        }
-        for w, r in replacements.items():
-            updated = updated.replace(w, r)
+        updated = updated.replace(" sir", " bro")
 
-    return updated
+    summary = f"Grammar and spelling corrected using LanguageTool with {mode} style."
+
+    return updated, summary
 
 
-def simple_correct(text: str, mode: str = "grammar"):
-    """
-    Grammar + spelling correction + light tone.
-    """
-    cleaned = text.strip()
-    if not cleaned:
-        return "", "No text provided."
-
-    corrected = apply_language_tool(cleaned)
-    corrected = basic_tone_adjust(corrected, mode)
-
-    if corrected:
-        corrected = corrected[0].upper() + corrected[1:]
-
-    if corrected and corrected[-1] not in ".!?":
-        corrected += "."
-
-    summary = f"Grammar and spelling corrected using LanguageToolPublicAPI with {mode} style."
-    return corrected, summary
-
-
-# ---------------------------
-# Routes
-# ---------------------------
-
+# ---------- /correct ----------
 
 @app.post("/correct")
 def correct_text(body: TextRequest):
@@ -290,45 +170,62 @@ def correct_text(body: TextRequest):
     }
 
 
+# ---------- /polish-ai (fluent rewrite) ----------
+
 @app.post("/polish-ai")
-def polish_ai(body: AIRewriteRequest):
-    """
-    Smart Rewrite v3:
-    1) Grammar pass
-    2) AI paraphrase with tone + style via Hugging Face
-    """
-    raw = body.text.strip()
-    if not raw:
+def polish_ai(body: AIRequest):
+    base = body.text.strip()
+    if not base:
         return {
             "correctedText": "",
             "changesSummary": "No text provided.",
         }
 
-    grammared, _ = simple_correct(raw, "grammar")
+    # Step 1: grammar
+    corrected, _ = simple_correct(base, "grammar")
 
-    tone = (body.tone or "friendly").lower()
-    style = (body.style or "neutral").lower()
-
-    prompt = build_hf_prompt(grammared, tone, style)
-    rewritten, used_hf = call_hf_rewrite(prompt, fallback=grammared)
-
-    tone_label = tone.capitalize()
-    style_label = style.capitalize()
-
-    if used_hf:
-        summary = (
-            f"Expression adjusted using Smart Rewrite v3 (Hugging Face) "
-            f"with '{tone_label}' tone and '{style_label}' writing style."
-        )
-    else:
-        summary = (
-            "Basic rewrite applied using grammar correction only; "
-            f"Hugging Face model was not available. Tone: '{tone_label}', Style: '{style_label}'."
-        )
+    # Step 2: fluent paraphrase via Hugging Face
+    fluent = generate_paraphrase(
+        corrected,
+        "paraphrase this to be more clear and fluent:",
+    )
 
     return {
-        "correctedText": rewritten,
-        "changesSummary": summary,
-        "appliedTone": tone,
-        "appliedStyle": style,
+        "correctedText": fluent,
+        "changesSummary": "Grammar and spelling corrected, then paraphrased using Hugging Face for more fluent English.",
+    }
+
+
+# ---------- /rewrite-tone ----------
+
+TONE_PROMPTS = {
+    "friendly": "paraphrase this in a warm and friendly tone:",
+    "professional": "paraphrase this in a polite and professional tone:",
+    "confident": "paraphrase this in a confident and assertive tone:",
+    "calm": "paraphrase this in a calm and respectful tone, softening any anger:",
+    "caring": "paraphrase this in a caring and supportive tone:",
+    "persuasive": "paraphrase this in a clear and persuasive tone:",
+}
+
+
+@app.post("/rewrite-tone")
+def rewrite_tone(body: ToneRequest):
+    base = body.text.strip()
+    if not base:
+        return {
+            "correctedText": "",
+            "changesSummary": "No text provided.",
+        }
+
+    tone_key = body.tone.lower()
+    prompt = TONE_PROMPTS.get(
+        tone_key,
+        "paraphrase this clearly and naturally:",
+    )
+
+    toned_text = generate_paraphrase(base, prompt)
+
+    return {
+        "correctedText": toned_text,
+        "changesSummary": f"Expression improved using AI with '{tone_key}' tone.",
     }
