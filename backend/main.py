@@ -3,8 +3,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 
+import os
+import requests
 import language_tool_python
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
 # ---------------------------
 # FastAPI app + CORS
@@ -12,15 +13,18 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 app = FastAPI()
 
 origins = [
+    # Local dev
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "http://localhost:8080",
     "http://127.0.0.1:8080",
+    # Deployed frontend (Vercel)
+    "https://grammar-correction-ai-by-shahid.vercel.app",
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=origins,  # for testing, you could temporarily use ["*"]
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -48,27 +52,19 @@ def apply_language_tool(text: str) -> str:
 
 
 # ---------------------------
-# AI paraphrase model (offline T5)
+# Hugging Face config (for rewrite)
 # ---------------------------
-PARA_MODEL_NAME = "t5-base"  # small enough + decent quality
 
-# Important: use_fast=False to avoid protobuf issues
-para_tokenizer = AutoTokenizer.from_pretrained(PARA_MODEL_NAME, use_fast=False)
-para_model = AutoModelForSeq2SeqLM.from_pretrained(PARA_MODEL_NAME)
+# You can change the model later if you want
+HF_API_URL = "https://api-inference.huggingface.co/models/google/flan-t5-base"
+HF_API_TOKEN = os.getenv("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")
 
 
-def smart_rewrite_v3(
-    text: str,
-    tone: str = "neutral",
-    style: str = "neutral",
-) -> str:
+def build_hf_prompt(text: str, tone: str, style: str) -> str:
     """
-    Smart Rewrite v3:
-    - Uses T5 to paraphrase
-    - Adds tone & style instructions
-    - Light post-processing (sentence splits etc.)
+    Build the same style of instruction you used for Smart Rewrite v3,
+    but now for a Hugging Face text2text model.
     """
-
     tone_instruction_map = {
         "friendly": "in a warm, friendly tone",
         "professional": "in a clear and professional tone",
@@ -94,37 +90,58 @@ def smart_rewrite_v3(
         f"Paraphrase the following text {tone_part} and {style_part}. "
         "Keep the original meaning and person the same. "
         "Use natural, fluent sentences and split long sentences if needed.\n\n"
-        f"Text: {text}"
+        f"Text: {text}\n\n"
+        "Rewritten:"
     )
+    return instruction
 
-    inputs = para_tokenizer(
-        instruction,
-        return_tensors="pt",
-        truncation=True,
-        max_length=256,
-    )
 
-    outputs = para_model.generate(
-        **inputs,
-        max_new_tokens=160,
-        num_beams=5,
-        do_sample=False,
-        early_stopping=True,
-    )
+def call_hf_rewrite(prompt: str) -> str:
+    """
+    Calls Hugging Face Inference API with the given prompt.
+    Falls back gracefully if something goes wrong.
+    """
+    # If token not set, just return prompt tail (so app doesn't crash)
+    if not HF_API_TOKEN:
+        print("HF_API_TOKEN not set; returning prompt as fallback.")
+        return prompt
 
-    raw = para_tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+    headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+    payload = {"inputs": prompt}
 
-    # --- Light post-processing: fix spaces and sentence endings ---
-    cleaned = " ".join(raw.split())
-    # Ensure first char capital
-    if cleaned:
-        cleaned = cleaned[0].upper() + cleaned[1:]
+    try:
+        resp = requests.post(HF_API_URL, headers=headers, json=payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
 
-    # Make sure it ends with punctuation
-    if cleaned and cleaned[-1] not in ".!?":
-        cleaned += "."
+        # For text2text models, HF usually returns a list of dicts with "generated_text"
+        generated = None
+        if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+            generated = data[0].get("generated_text")
+        elif isinstance(data, dict) and "generated_text" in data:
+            generated = data["generated_text"]
 
-    return cleaned
+        if not generated:
+            generated = str(data)
+
+        text = generated.strip()
+
+        # Remove a possible "Rewritten:" prefix
+        if text.lower().startswith("rewritten:"):
+            text = text[len("rewritten:") :].strip()
+
+        # Basic cleanup
+        text = " ".join(text.split())
+        if text and text[0].isalpha():
+            text = text[0].upper() + text[1:]
+        if text and text[-1] not in ".!?":
+            text += "."
+
+        return text
+    except Exception as e:
+        print("Hugging Face API error:", e)
+        # Fallback: return original prompt on error so endpoint still works
+        return prompt
 
 
 # ---------------------------
@@ -230,7 +247,7 @@ def polish_ai(body: AIRewriteRequest):
     """
     Smart Rewrite v3:
     1) Grammar pass
-    2) AI paraphrase with tone + style
+    2) AI paraphrase with tone + style via Hugging Face
     """
 
     raw = body.text.strip()
@@ -247,13 +264,14 @@ def polish_ai(body: AIRewriteRequest):
     tone = (body.tone or "friendly").lower()
     style = (body.style or "neutral").lower()
 
-    rewritten = smart_rewrite_v3(grammared, tone=tone, style=style)
+    prompt = build_hf_prompt(grammared, tone, style)
+    rewritten = call_hf_rewrite(prompt)
 
     # Build human-readable summary
     tone_label = tone.capitalize()
     style_label = style.capitalize()
     summary = (
-        f"Expression adjusted using Smart Rewrite v3 "
+        f"Expression adjusted using Smart Rewrite v3 (Hugging Face) "
         f"with '{tone_label}' tone and '{style_label}' writing style."
     )
 
